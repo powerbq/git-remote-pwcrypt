@@ -1,20 +1,21 @@
-Source: git-remote-gcrypt
+Source: git-remote-pwcrypt
 Section: vcs
 Priority: optional
 Build-Depends: debhelper (>= 10), python3-docutils (>= 0.12+dfsg)
-Maintainer: Sean Whitton <spwhitton@spwhitton.name>
+Maintainer: powerbq <powerbq@gmail.com>
 Standards-Version: 4.1.0
-Homepage: https://spwhitton.name/tech/code/git-remote-gcrypt/
-Vcs-Git: https://git.spwhitton.name/git-remote-gcrypt
-Vcs-Browser: https://git.spwhitton.name/git-remote-gcrypt
+Homepage: https://github.com/powerbq/git-remote-pwcrypt
+Vcs-Git: https://github.com/powerbq/git-remote-pwcrypt.git
+Vcs-Browser: https://github.com/powerbq/git-remote-pwcrypt
 
-Package: git-remote-gcrypt
+Package: git-remote-pwcrypt
 Architecture: all
 Depends: git, gpg | gnupg1, ${misc:Depends}
 Recommends: rsync, curl, gnupg
 Suggests: rclone
-Description: encrypted git repositories
- This lets git store git repositories in encrypted form.
+Description: passphrase-encrypted git repositories
+ This lets git store git repositories in encrypted form, protected by a
+ passphrase only (no GPG keys).  It is a fork of git-remote-gcrypt.
  It supports storing repositories on rsync or sftp servers.
  It can also store the encrypted git repository inside a remote git
  repository. All the regular git commands like git push and git pull

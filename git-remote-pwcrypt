@@ -1,6 +1,6 @@
 #!/bin/sh
 
-#  git-remote-gcrypt
+#  git-remote-pwcrypt
 #
 #  Copyright (c) 2013 engla
 #  Copyright (c) 2013, 2014 Joey Hess <id@joeyh.name>
@@ -19,14 +19,21 @@
 #  You should have received a copy of the GNU General Public License
 #  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
+#  Modified 2026-11-20: git-remote-pwcrypt, a fork of git-remote-gcrypt
+#  (upstream commit a5ff704) that encrypts with a passphrase only (GPG
+#  key mode removed), adds --calibrate, --change-passphrase and
+#  --reencrypt, and renames the URL scheme, configuration keys,
+#  environment variables, refs and local directory from gcrypt to
+#  pwcrypt so both tools can be installed.
+#
 #  See README.rst for usage instructions
 
 set -e # errexit
 set -f # noglob
 set -C # noclobber
 
-export GITCEPTION="${GITCEPTION:-}+" # Reuse $Gref except when stacked
-Gref="refs/gcrypt/gitception$GITCEPTION"
+export PWCRYPT_GITCEPTION="${PWCRYPT_GITCEPTION:-}+" # Reuse $Gref except when stacked
+Gref="refs/pwcrypt/gitception$PWCRYPT_GITCEPTION"
 Gref_rbranch="refs/heads/master"
 Packkey_bytes=63  # nbr random bytes for packfile keys, any >= 256 bit is ok
 Hashtype=SHA256   # SHA512 SHA384 SHA256 SHA224 supported.
@@ -37,7 +44,7 @@ Hex40=$Hex40$Hex40$Hex40$Hex40$Hex40 # Match SHA-1 hexdigest
 GPG="$(git config --get "gpg.program" '.+' || echo gpg)"
 
 Did_find_repo=  # yes for connected, no for no repo
-Localdir="${GIT_DIR:=.git}/remote-gcrypt"
+Localdir="${GIT_DIR:=.git}/remote-pwcrypt"
 Tempdir=
 
 Repoid=
@@ -47,7 +54,11 @@ Keeplist=
 Extnlist=
 Repack_limit=25
 
-Recipients=
+# The manifest is encrypted with a passphrase (no GPG keys)
+Passphrase=       # kept only in this process' memory, never exported
+Stty_saved=
+Conf_s2k_count=
+S2k_count_max=65011712
 
 # compat/utility functions
 # xfeed: The most basic output function puts $1 into the stdin of $2..$#
@@ -62,7 +73,7 @@ EOF
 xecho() { xfeed "$*" cat; }
 xecho_n() { xecho "$@" | tr -d \\n ; } # kill newlines
 echo_git() { xecho "$@" ; }  # Code clarity
-echo_info() { xecho "gcrypt:" "$@" >&2; }
+echo_info() { xecho "pwcrypt:" "$@" >&2; }
 echo_die() { echo_info "$@" ; exit 1; }
 
 isnull() { case "$1" in "") return 0;; *) return 1;; esac; }
@@ -350,29 +361,92 @@ $1
 EOF
 }
 
-# Encrypt to recipients $1
-PRIVENCRYPT()
+# Passphrase mode: the passphrase goes to gpg through a pipe on fd 0
+# (printf is a shell builtin, so it never appears in a process' argv or
+# environment); the data goes through fd 4/5 via --enable-special-filenames.
+PPENCRYPT()
 {
-	set -- $1
-	if isnonnull "$Conf_signkey"; then
-		set -- "$@" -u "$Conf_signkey"
-	fi
-	rungpg --compress-algo none --trust-model=always -se "$@"
+	{ printf '%s\n' "$Passphrase" |
+		rungpg --batch --pinentry-mode loopback --no-symkey-cache \
+		--passphrase-fd 0 --enable-special-filenames \
+		--compress-algo none --cipher-algo AES256 \
+		--s2k-mode 3 --s2k-digest-algo SHA512 \
+		--s2k-count "$Conf_s2k_count" -c -o - -- '-&4'; } 4<&0
 }
 
-# $1 is the match for good signature, $2 is the textual signers list
-PRIVDECRYPT()
+# Decrypt stdin with the passphrase; output only if it was really
+# passphrase-encrypted and integrity-protected. An unencrypted OpenPGP
+# literal packet makes gpg -d succeed, so the exit code is not enough.
+PPDECRYPT()
 {
 	local status_=
-	exec 4>&1 &&
-	status_=$(rungpg --status-fd 3 -q -d 3>&1 1>&4) &&
-	xfeed "$status_" grep "^\[GNUPG:\] ENC_TO " >/dev/null &&
-	(xfeed "$status_" grep -e "$1" >/dev/null || {
-		echo_info "Failed to verify manifest signature!" &&
-		echo_info "Only accepting signatories: ${2:-(none)}" &&
+	exec 6>&1 &&
+	status_=$({ printf '%s\n' "$Passphrase" |
+		rungpg -q --batch --pinentry-mode loopback --no-symkey-cache \
+		--passphrase-fd 0 --enable-special-filenames \
+		--status-fd 3 -d -o - -- '-&5' 3>&1 1>&6; } 5<&0) || return 1
+	if xfeed "$status_" grep -q -e '^\[GNUPG:\] ENC_TO ' \
+		-e '^\[GNUPG:\] BADMDC' -e '^\[GNUPG:\] DECRYPTION_FAILED' ||
+		! xfeed "$status_" grep -q '^\[GNUPG:\] NEED_PASSPHRASE_SYM ' ||
+		! xfeed "$status_" grep -q '^\[GNUPG:\] DECRYPTION_OKAY' ||
+		! xfeed "$status_" grep -q -e '^\[GNUPG:\] GOODMDC' \
+			-e '^\[GNUPG:\] DECRYPTION_INFO [0-9]* [0-9]* [1-9]'
+	then
+		echo_info "Manifest is not passphrase-encrypted with integrity protection!"
 		return 1
-	})
+	fi
 }
+
+tty_restore()
+{
+	if isnonnull "$Stty_saved"; then
+		stty "$Stty_saved" < /dev/tty 2>/dev/null || :
+		Stty_saved=
+	fi
+}
+
+# $1 prompt, $2 return var. Uses PWCRYPT_ASKPASS if set, else /dev/tty
+# (stdin/stdout of a remote helper belong to git).
+ask_secret()
+{
+	local f_ans=
+	if isnonnull "${PWCRYPT_ASKPASS:-}"; then
+		f_ans=$("$PWCRYPT_ASKPASS" "$1") ||
+			echo_die "PWCRYPT_ASKPASS program failed"
+	else
+		{ : < /dev/tty; } 2>/dev/null ||
+			echo_die "No terminal to ask for the passphrase (set PWCRYPT_ASKPASS)"
+		Stty_saved=$(stty -g < /dev/tty)
+		printf '%s' "$1" > /dev/tty
+		stty -echo < /dev/tty
+		IFS= read -r f_ans < /dev/tty || f_ans=
+		tty_restore
+		printf '\n' > /dev/tty
+	fi
+	setvar "$2" "$f_ans"
+}
+
+# Ask once per process; later calls reuse the value in memory
+get_passphrase()
+{
+	isnull "$Passphrase" || return 0
+	ask_secret "pwcrypt: passphrase for $NAME: " @Passphrase
+	isnonnull "$Passphrase" || echo_die "Empty passphrase"
+}
+
+new_passphrase()
+{
+	local f_again=
+	Passphrase=
+	ask_secret "pwcrypt: NEW passphrase for $NAME: " @Passphrase
+	isnonnull "$Passphrase" || echo_die "Empty passphrase"
+	ask_secret "pwcrypt: repeat NEW passphrase: " @f_again
+	iseq "$Passphrase" "$f_again" || { Passphrase=; echo_die "Passphrases do not match"; }
+	f_again=
+}
+
+PRIVENCRYPT() { PPENCRYPT; }
+PRIVDECRYPT() { PPDECRYPT; }
 
 # Generate $1 random bytes
 genkey()
@@ -417,104 +491,43 @@ make_new_repo()
 
 	# Needed assumption: the same user should have no duplicate Repoid
 	Repoid=":id:$(genkey 15)"
-	iseq "${NAME#gcrypt::}" "$URL" ||
-		git config "remote.$NAME.gcrypt-id" "$Repoid"
+	iseq "${NAME#pwcrypt::}" "$URL" ||
+		git config "remote.$NAME.pwcrypt-id" "$Repoid"
 	echo_info "Remote ID is $Repoid"
 	Extnlist="extn comment"
 }
 
 
-# $1 return var for goodsig match, $2 return var for signers text
 read_config()
 {
-	local recp_= r_tail= r_keyinfo= r_keyfpr= gpg_list= cap_= conf_part= good_sig= signers_=
-	Conf_signkey=$(git config --get "remote.$NAME.gcrypt-signingkey" '.+' ||
-		git config --path user.signingkey || :)
-	conf_part=$(git config --get "remote.$NAME.gcrypt-participants" '.+' ||
-		git config --get gcrypt.participants '.+' || :)
-	Conf_pubish_participants=$(git config --get --bool "remote.$NAME.gcrypt-publish-participants" '.+' ||
-		git config --get --bool gcrypt.publish-participants || :)
-	Conf_gpg_args=$(git config --get gcrypt.gpg-args '.+' || :)
-	Conf_rsync_put_flags=$(git config --get "remote.$NAME.gcrypt-rsync-put-flags" '.+' ||
-		git config --get "gcrypt.rsync-put-flags" '.+' || :)
-	Conf_force_required=$(git config --get --bool "remote.$NAME.gcrypt-require-explicit-force-push" '.+' ||
-		git config --get --bool gcrypt.require-explicit-force-push '.+' || :)
-
-	# Figure out which keys we should encrypt to or accept signatures from
-	if isnull "$conf_part" || iseq "$conf_part" simple
-	then
-		signers_="(default keyring)"
-		Recipients="--throw-keyids --default-recipient-self"
-		good_sig="^\[GNUPG:\] GOODSIG "
-		setvar "$1" "$good_sig"
-		setvar "$2" "$signers_"
-		return 0
-	fi
-
-	for recp_ in $conf_part
-	do
-		gpg_list=$(rungpg --with-colons --fingerprint -k "$recp_")
-		r_tail_=$(echo "$recp_" | sed -e 's/^0x//')
-		filter_to @r_keyinfo "pub*" "$gpg_list"
-		if echo "$recp_" | grep -E -q '^[xA-F0-9]+$'; then # is $recp_ a keyid?
-			filter_to @r_keyfpr "fpr*$r_tail_*" "$gpg_list"
-		else
-			filter_to @r_keyfpr "fpr*" "$gpg_list"
-		fi
-		isnull "$r_keyinfo" || isnonnull "${r_keyinfo##*"$Newline"*}" ||
-		echo_info "WARNING: '$recp_' matches multiple keys, using one"
-		isnull "$r_keyfpr" || isnonnull "${r_keyfpr##*"$Newline"*}" ||
-		echo_info "WARNING: '$recp_' matches multiple fingerprints, using one"
-		r_keyinfo=${r_keyinfo%%"$Newline"*}
-		r_keyfpr=${r_keyfpr%%"$Newline"*}
-		keyid_=$(xfeed "$r_keyinfo" cut -f 5 -d :)
-		fprid_=$(xfeed "$r_keyfpr" cut -f 10 -d :)
-
-		isnonnull "$fprid_" &&
-		signers_="$signers_ $keyid_" &&
-		append_to @good_sig "^\[GNUPG:\] VALIDSIG .*$fprid_$" || {
-			echo_info "WARNING: Skipping missing key $recp_"
-			continue
-		}
-		# Check 'E'ncrypt capability
-		cap_=$(xfeed "$r_keyinfo" cut -f 12 -d :)
-		if ! iseq "${cap_#*E}" "$cap_"; then
-			if [ "$Conf_pubish_participants" = true ]; then
-				Recipients="$Recipients -r $keyid_"
-			else
-				Recipients="$Recipients -R $keyid_"
-			fi
-		fi
-	done
-
-	if isnull "$Recipients"
-	then
-		echo_info "You have not configured any keys you can encrypt to" \
-			"for this repository"
-		echo_info "Use ::"
-		echo_info "  git config gcrypt.participants YOURKEYID"
-		exit 1
-	fi
-	setvar "$1" "$good_sig"
-	setvar "$2" "$signers_"
+	Conf_gpg_args=$(git config --get pwcrypt.gpg-args '.+' || :)
+	Conf_rsync_put_flags=$(git config --get "remote.$NAME.pwcrypt-rsync-put-flags" '.+' ||
+		git config --get "pwcrypt.rsync-put-flags" '.+' || :)
+	Conf_force_required=$(git config --get --bool "remote.$NAME.pwcrypt-require-explicit-force-push" '.+' ||
+		git config --get --bool pwcrypt.require-explicit-force-push '.+' || :)
+	Conf_s2k_count=$(git config --get "remote.$NAME.pwcrypt-s2k-count" '.+' ||
+		git config --get pwcrypt.s2k-count '.+' || echo "$S2k_count_max")
+	case "$Conf_s2k_count" in
+	''|*[!0-9]*) echo_die "pwcrypt-s2k-count must be a number";;
+	esac
 }
 
 ensure_connected()
 {
-	local manifest_= r_repoid= r_name= url_frag= r_sigmatch= r_signers= \
-		tmp_manifest= tmp_stderr=
+	local manifest_= r_repoid= r_name= url_frag= \
+		tmp_manifest= tmp_stderr= tries_=0
 
 	if isnonnull "$Did_find_repo"
 	then
 		return
 	fi
 	Did_find_repo=no
-	read_config @r_sigmatch @r_signers
+	read_config
 
-	iseq "${NAME#gcrypt::}" "$URL" || r_name=$NAME
+	iseq "${NAME#pwcrypt::}" "$URL" || r_name=$NAME
 
 	if isurl gitception "$URL" && isnonnull "$r_name"; then
-		git config "remote.$r_name.url" "gcrypt::${URL#gitception://}"
+		git config "remote.$r_name.url" "pwcrypt::${URL#gitception://}"
 		echo_info "Updated URL for $r_name, gitception:// -> ()"
 	fi
 
@@ -535,7 +548,7 @@ ensure_connected()
 
 	Repoid=
 	isnull "$r_name" ||
-		Repoid=$(git config "remote.$r_name.gcrypt-id" || :)
+		Repoid=$(git config "remote.$r_name.pwcrypt-id" || :)
 
 
 	tmp_manifest="$Tempdir/maniF"
@@ -554,9 +567,18 @@ ensure_connected()
 
 	Did_find_repo=yes
 	echo_info "Decrypting manifest"
-	manifest_=$(PRIVDECRYPT "$r_sigmatch" "$r_signers" < "$tmp_manifest") &&
-		isnonnull "$manifest_" ||
-		echo_die "Failed to decrypt manifest!"
+	while :
+	do
+		get_passphrase
+		manifest_=$(PRIVDECRYPT < "$tmp_manifest") &&
+			isnonnull "$manifest_" && break
+		Passphrase=
+		tries_=$(( tries_ + 1 ))
+		if [ "$tries_" -ge 3 ]; then
+			echo_die "Failed to decrypt manifest! (wrong passphrase?)"
+		fi
+		echo_info "Failed to decrypt manifest, try again"
+	done
 	rm -f "$tmp_manifest"
 
 	filter_to @Refslist "$Hex40 *" "$manifest_"
@@ -583,7 +605,7 @@ ensure_connected()
 		return 0
 	fi
 
-	isnull "$r_name" || git config "remote.$r_name.gcrypt-id" "$r_repoid"
+	isnull "$r_name" || git config "remote.$r_name.pwcrypt-id" "$r_repoid"
 }
 
 # $1 is the hash type (SHA256 etc)
@@ -626,7 +648,7 @@ get_pack_files()
 		then
 			# add to local pack list
 			git index-pack -v --stdin >/dev/null
-			xecho "pack $pack_id" >> "$Localdir/have_packs$GITCEPTION"
+			xecho "pack $pack_id" >> "$Localdir/have_packs$PWCRYPT_GITCEPTION"
 		else
 			git index-pack -v --stdin "$1/${pack_}.pack" >/dev/null
 		fi
@@ -641,7 +663,7 @@ repack_if_needed()
 
 	isnonnull "$Packlist" || return 0
 
-	if isnonnull "${GCRYPT_FULL_REPACK:-}"
+	if isnonnull "${PWCRYPT_FULL_REPACK:-}"
 	then
 		Keeplist=
 		Repack_limit=0
@@ -715,7 +737,7 @@ do_fetch()
 
 	ensure_connected
 
-	# The `+` for $GITCEPTION is pointless but we will be safe for stacking
+	# The `+` for $PWCRYPT_GITCEPTION is pointless but we will be safe for stacking
 	pick_fields_1_2 @premote_ "$Packlist"
 	if [ -s "$Localdir/have_packs+" ]
 	then
@@ -745,6 +767,10 @@ do_push()
 	if iseq "$Did_find_repo" "no"
 	then
 		make_new_repo
+	fi
+	if isnull "$Passphrase"
+	then
+		new_passphrase
 	fi
 
 	if isnonnull "$Refslist"
@@ -778,11 +804,11 @@ EOF
 	then
 		if [ "$Conf_force_required" = true ]
 		then
-			echo_die "Implicit force push disallowed by gcrypt configuration."
+			echo_die "Implicit force push disallowed by pwcrypt configuration."
 		else
 			echo_info "Due to a longstanding bug, this push implicitly has --force."
 			echo_info "Consider explicitly passing --force, and setting"
-			echo_info "gcrypt's require-explicit-force-push git config key."
+			echo_info "pwcrypt's require-explicit-force-push git config key."
 		fi
 	fi
 
@@ -811,11 +837,10 @@ EOF
 	fi
 
 	# Generate manifest
-	echo_info "Encrypting to: $Recipients"
-	echo_info "Requesting manifest signature"
+	echo_info "Encrypting manifest with passphrase"
 
 	tmp_manifest="$Tempdir/maniP"
-	PRIVENCRYPT "$Recipients" > "$tmp_manifest" <<EOF
+	PRIVENCRYPT > "$tmp_manifest" <<EOF
 $Refslist
 $Packlist
 $Keeplist
@@ -861,6 +886,7 @@ EOF
 
 cleanup_tmpfiles()
 {
+	tty_restore
 	if isnonnull "${Tempdir%%*."$$"}"; then
 		echo_die "Unexpected Tempdir value: $Tempdir"
 	fi
@@ -873,7 +899,7 @@ setup()
 
 	# Set up a subdirectory in /tmp
 	temp_key=$(genkey 9 | tr '/' _)
-	Tempdir="${TMPDIR:-/tmp}/git-remote-gcrypt-${temp_key}.$$"
+	Tempdir="${TMPDIR:-/tmp}/git-remote-pwcrypt-${temp_key}.$$"
 	case "${MSYSTEM:-unknown}" in
 	MSYS*|MINGW*)
 		mkdir "${Tempdir}"
@@ -894,7 +920,7 @@ setup()
 }
 
 # handle git-remote-helpers protocol
-gcrypt_main_loop()
+pwcrypt_main_loop()
 {
 	local input_= input_inner= r_args= temp_key=
 
@@ -953,9 +979,100 @@ gcrypt_main_loop()
 	done
 }
 
-if [ "x$1" = x--check ]
+# Milliseconds clock (GNU date, else perl)
+now_ms()
+{
+	local f_t=
+	f_t=$(date +%s%N 2>/dev/null || :)
+	case "$f_t" in
+	*N*|'') perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000' ;;
+	*) xecho "$(( f_t / 1000000 ))" ;;
+	esac
+}
+
+# Suggest pwcrypt.s2k-count for a target decryption time in ms ($1)
+calibrate()
+{
+	local target_=${1:-100} probe_=8388608 t0_= t1_= ms_= best_=999999 i_= count_= tmpd_=
+	tmpd_=$(mktemp -d) || echo_die "mktemp failed"
+	Passphrase="calibration-only"
+	Conf_s2k_count=$probe_
+	xecho x | PPENCRYPT > "$tmpd_/c" 2>/dev/null || echo_die "gpg failed"
+	for i_ in 1 2 3; do
+		t0_=$(now_ms)
+		PPDECRYPT < "$tmpd_/c" > /dev/null 2>&1 || echo_die "gpg failed"
+		t1_=$(now_ms)
+		ms_=$(( t1_ - t0_ ))
+		[ "$ms_" -lt "$best_" ] && best_=$ms_
+	done
+	rm -rf -- "$tmpd_"
+	[ "$best_" -ge 1 ] || best_=1
+	count_=$(( probe_ / best_ * target_ ))
+	if [ "$count_" -gt "$S2k_count_max" ]; then
+		echo_info "Target ${target_} ms is above GnuPG's S2K maximum on this machine."
+		echo_info "Maximum count $S2k_count_max takes about $(( best_ * S2k_count_max / probe_ )) ms here."
+		count_=$S2k_count_max
+	fi
+	[ "$count_" -ge 65536 ] || count_=65536
+	echo_info "Measured: ${best_} ms for count $probe_"
+	echo_info "Suggested (about $(( best_ * count_ / probe_ )) ms here):"
+	echo_info "  git config pwcrypt.s2k-count $count_"
+	echo_info "It takes effect on the next push or --change-passphrase."
+}
+
+# Standalone commands that work on remote $1 of the current repository
+standalone_remote()
+{
+	NAME=${1:-}
+	isnonnull "$NAME" ||
+		echo_die "Usage: git-remote-pwcrypt $Cmd REMOTE"
+	GIT_DIR=$(git rev-parse --git-dir) || exit 1
+	export GIT_DIR
+	Localdir="$GIT_DIR/remote-pwcrypt"
+	URL=$(git config --get "remote.$NAME.url") ||
+		echo_die "No such remote: $NAME"
+	isnull "${URL##pwcrypt::*}" || echo_die "Remote $NAME is not a pwcrypt:: remote"
+	URL=${URL#pwcrypt::}
+	setup
+	ensure_connected
+	iseq "$Did_find_repo" yes || echo_die "Repository not found: $URL"
+}
+
+Cmd=${1:-}
+if [ "x$1" = x--calibrate ]
 then
-	NAME=dummy-gcrypt-check
+	NAME=calibrate
+	calibrate "${2:-100}"
+elif [ "x$1" = x--change-passphrase ]
+then
+	standalone_remote "${2:-}"
+	new_passphrase
+	tmp_manifest="$Tempdir/maniC"
+	PRIVENCRYPT > "$tmp_manifest" <<EOF
+$Refslist
+$Packlist
+$Keeplist
+repo $Repoid
+$Extnlist
+EOF
+	PRIVDECRYPT < "$tmp_manifest" > /dev/null ||
+		echo_die "Self-check of the new manifest failed, nothing uploaded"
+	PUT "$URL" "$Manifestfile" "$tmp_manifest"
+	PUT_FINAL "$URL"
+	echo_info "Passphrase changed for $NAME"
+elif [ "x$1" = x--reencrypt ]
+then
+	# Full repack: every packfile is downloaded, written again as one pack
+	# under a fresh random key, the old packs are deleted, and a new
+	# manifest is written. Same passphrase (or same keys in key mode).
+	standalone_remote "${2:-}"
+	isnonnull "$Packlist" || echo_die "Remote $NAME has no packfiles"
+	PWCRYPT_FULL_REPACK=1
+	do_push "+:" > /dev/null
+	echo_info "Re-encrypted all packfiles of $NAME with fresh keys"
+elif [ "x$1" = x--check ]
+then
+	NAME=dummy-pwcrypt-check
 	URL=$2
 	setup
 	ensure_connected
@@ -965,5 +1082,5 @@ then
 		exit 100
 	fi
 else
-	gcrypt_main_loop "$@"
+	pwcrypt_main_loop "$@"
 fi

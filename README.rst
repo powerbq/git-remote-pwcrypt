@@ -1,23 +1,35 @@
-=================
-git-remote-gcrypt
-=================
+==================
+git-remote-pwcrypt
+==================
 
---------------------------------------
-GNU Privacy Guard-encrypted git remote
---------------------------------------
+-----------------------------------------------------------
+Passphrase-encrypted git remote (fork of git-remote-gcrypt)
+-----------------------------------------------------------
 
 :Manual section: 1
 
 Description
 ===========
 
-git-remote-gcrypt is a git remote helper to push and pull from
-repositories encrypted with GnuPG, using a custom format.  This remote
-helper handles URIs prefixed with `gcrypt::`.
+git-remote-pwcrypt is a fork of git-remote-gcrypt
+(https://github.com/spwhitton/git-remote-gcrypt, upstream commit a5ff704).
+It encrypts the whole repository with a passphrase only: there are no
+GPG keys (see "Passphrase mode"). For GPG keys use git-remote-gcrypt.
+It uses its own URL scheme (``pwcrypt::``), configuration keys
+(``pwcrypt-*``, ``pwcrypt.*``), environment variables (``PWCRYPT_*``)
+and local directory, so it can be installed next to git-remote-gcrypt.
+The two are not interchangeable: git-remote-gcrypt cannot read a
+pwcrypt remote and pwcrypt cannot read a gcrypt remote.
+
+
+git-remote-pwcrypt is a git remote helper to push and pull from
+repositories encrypted with a passphrase through GnuPG's symmetric
+encryption, using a custom format.  This remote
+helper handles URIs prefixed with `pwcrypt::`.
 
 Supported backends are `local`, `rsync://` and `sftp://`, where the
 repository is stored as a set of files, or instead any `<giturl>`
-where gcrypt will store the same representation in a git repository,
+where pwcrypt will store the same representation in a git repository,
 bridged over arbitrary git transport.  Prefer `local` or `rsync://` if
 you can use one of those; see "Performance" below for discussion.
 
@@ -30,22 +42,23 @@ collaboration using typical untrusted file hosts or services.
 Installation
 ............
 
-* use your GNU/Linux distribution's package manager -- Debian, Ubuntu,
-  Fedora, Arch and some smaller distros are known to have packages
 
-* run the supplied ``install.sh`` script on other systems
+* run the supplied ``install.sh`` script (or copy ``git-remote-pwcrypt``
+  into a directory in your ``PATH``)
 
 Quickstart
 ..........
 
 Create an encrypted remote by pushing to it::
 
-    git remote add cryptremote gcrypt::rsync://example.com/repo
+    git remote add cryptremote pwcrypt::rsync://example.com/repo
     git push cryptremote master
-    > gcrypt: Setting up new repository
-    > gcrypt: Remote ID is :id:7VigUnLVYVtZx8oir34R
+    > pwcrypt: Setting up new repository
+    > pwcrypt: NEW passphrase for cryptremote:
+    > pwcrypt: repeat NEW passphrase:
+    > pwcrypt: Remote ID is :id:7VigUnLVYVtZx8oir34R
     > [ more lines .. ]
-    > To gcrypt::[...]
+    > To pwcrypt::[...]
     > * [new branch]      master -> master
 
 Configuration
@@ -53,56 +66,23 @@ Configuration
 
 The following ``git-config(1)`` variables are supported:
 
-``remote.<name>.gcrypt-participants``
-    ..
-``gcrypt.participants``
-    Space-separated list of GPG key identifiers. The remote is encrypted
-    to these participants and only signatures from these are accepted.
-    ``gpg -k`` lists all public keys you know.
-
-    If this option is not set, we encrypt to your default key and accept
-    any valid signature. This behavior can also be requested explicitly
-    by setting participants to ``simple``.
-
-    The ``gcrypt-participants`` setting on the remote takes precedence
-    over the repository variable ``gcrypt.participants``.
-
-``remote.<name>.gcrypt-publish-participants``
-    ..
-``gcrypt.publish-participants``
-    By default, the gpg key ids of the participants are obscured by
-    encrypting using ``gpg -R``. Setting this option to ``true`` disables
-    that security measure.
-
-    The problem with using ``gpg -R`` is that to decrypt, gpg tries each
-    available secret key in turn until it finds a usable key.
-    This can result in unnecessary passphrase prompts.
-
-``gcrypt.gpg-args``
+``pwcrypt.gpg-args``
     The contents of this setting are passed as arguments to gpg.
     E.g. ``--use-agent``.
 
-``remote.<name>.gcrypt-signingkey``
+``remote.<name>.pwcrypt-rsync-put-flags``
     ..
-``user.signingkey``
-    (The latter from regular git configuration) The key to use for signing.
-    You should set ``user.signingkey`` if your default signing key is not
-    part of the participant list. You may use the per-remote version
-    to sign different remotes using different keys.
-
-``remote.<name>.gcrypt-rsync-put-flags``
-    ..
-``gcrypt.rsync-put-flags``
+``pwcrypt.rsync-put-flags``
     Flags to be passed to ``rsync`` when uploading to a remote using the
     ``rsync://`` backend. If the flags are set to a specific remote, the
     global flags, if also set, will not be applied for that remote.
 
-``remote.<name>.gcrypt-require-explicit-force-push``
+``remote.<name>.pwcrypt-require-explicit-force-push``
     ..
-``gcrypt.require-explicit-force-push``
+``pwcrypt.require-explicit-force-push``
     A longstanding bug is that every git push effectively has a ``--force``.
 
-    If this flag is set to ``true``, git-remote-gcrypt will refuse to push,
+    If this flag is set to ``true``, git-remote-pwcrypt will refuse to push,
     unless ``--force`` is passed, or refspecs are prefixed with ``+``.
 
     There is a potential solution here: https://bugs.debian.org/877464#32
@@ -110,24 +90,80 @@ The following ``git-config(1)`` variables are supported:
 Environment variables
 =====================
 
-*GCRYPT_FULL_REPACK*
+*PWCRYPT_FULL_REPACK*
     When set (to anything other than the empty string), this environment
     variable forces a full repack when pushing.
 
+*PWCRYPT_ASKPASS*
+    Program that prints the passphrase on stdout;
+    it gets the prompt as its only argument. Without it the passphrase
+    is read from ``/dev/tty``.
+
+Passphrase mode
+===============
+
+The manifest is encrypted with ``gpg --symmetric`` (AES-256, iterated
+and salted S2K with SHA-512); no GPG keys or signatures are used.
+Packfiles are encrypted with random keys listed in the manifest, as in
+git-remote-gcrypt.
+
+* The passphrase is asked once per git command (``fetch``, ``push``,
+  ``clone``, ``pull``) and kept only in the memory of that helper
+  process. It is never written to disk, exported to the environment,
+  or passed on a command line: it reaches gpg through a pipe from the
+  ``printf`` shell builtin, with ``--no-symkey-cache`` so gpg-agent
+  does not keep it.
+* A first push to a new remote asks for a new passphrase twice.
+  A wrong passphrase is retried up to three times.
+* The decrypted manifest is accepted only if gpg reports a
+  passphrase-encrypted, integrity-protected message; an unencrypted
+  OpenPGP packet planted on the server is rejected.
+* Integrity comes from the passphrase alone: anyone who knows it can
+  write a valid manifest.
+
+``remote.<name>.pwcrypt-s2k-count``
+    ..
+``pwcrypt.s2k-count``
+    S2K iteration count used when the manifest is written (default and
+    maximum: 65011712). Decryption reads the count from the manifest.
+
+``git-remote-pwcrypt --calibrate [MS]``
+    Measures this machine and suggests ``pwcrypt.s2k-count`` for a target
+    decryption time (default 100 ms). GnuPG caps the count, so long
+    targets such as 1 s may not be reachable; the command says so.
+
+``git-remote-pwcrypt --change-passphrase REMOTE``
+    Run inside the repository. Asks for the current passphrase, then the
+    new one twice, re-encrypts only the manifest, checks that it decrypts
+    with the new passphrase, and uploads it. Packfiles are not rewritten,
+    so whoever kept an old manifest and knows the old passphrase can
+    still read the packs it lists; run ``--reencrypt`` afterwards.
+
+``git-remote-pwcrypt --reencrypt REMOTE``
+    Run inside the repository. Downloads every packfile, writes the whole
+    history again as one pack under a fresh random key, deletes the old
+    packs and writes a new manifest, keeping the passphrase.
+    Unlike ``PWCRYPT_FULL_REPACK=1 git push``, it works when there is
+    nothing new to push. With a git backend such as GitHub, the old
+    objects become unreachable but the host may keep them for a while.
+
+Set up::
+
+    git remote add origin pwcrypt::git@github.com:user/env.git
+    git push origin HEAD
+
+Clone::
+
+    git clone pwcrypt::git@github.com:user/env.git
+
 Examples
 ========
-
-How to set up a remote for two participants::
-
-    git remote add cryptremote gcrypt::rsync://example.com/repo
-    git config remote.cryptremote.gcrypt-participants "KEY1 KEY2"
-    git push cryptremote master
 
 How to use a git backend::
 
     # notice that the target git repo must already exist and its
     # `next` branch will be overwritten!
-    git remote add gitcrypt gcrypt::git@example.com:repo#next
+    git remote add gitcrypt pwcrypt::git@example.com:repo#next
     git push gitcrypt master
 
 The URL fragment (``#next`` here) indicates which backend branch is used.
@@ -136,9 +172,9 @@ Notes
 =====
 
 Collaboration
-    The encryption of the manifest is updated for each push to match the
-    participant configuration. Each pushing user must have the public
-    keys of all collaborators and correct participant config.
+    Everyone who knows the passphrase can read and push. There is no
+    per-person access: to remove someone, change the passphrase and run
+    ``--reencrypt``.
 
 Dependencies
     ``rsync``, ``curl`` and ``rclone`` for remotes ``rsync:``, ``sftp:`` and
@@ -146,14 +182,13 @@ Dependencies
     shell that supports ``local``.
 
 GNU Privacy Guard
-    Both GPG 1.4 and 2 are supported. You need a personal GPG key. GPG
-    configuration applies to algorithm choices for public-key
-    encryption, symmetric encryption, and signing. See ``man gpg`` for
-    more information.
+    GnuPG 2.2.7 or later is needed (for ``--no-symkey-cache`` and
+    ``--pinentry-mode loopback``); tested with 2.4.4. No GPG keys are
+    needed.
 
 Remote ID
     The Remote ID is not secret; it only ensures that two repositories
-    signed by the same user can be distinguished.  You will see
+    can be distinguished.  You will see
     a warning if the Remote ID changes, which should only happen if the
     remote was re-created.
 
@@ -162,7 +197,7 @@ Performance
     uploading the entire repository history with each push.  This
     means that pushes of your repository become slower over time, as
     your git history becomes longer, and it can easily get to the
-    point that continued usage of git-remote-gcrypt is impractical.
+    point that continued usage of git-remote-pwcrypt is impractical.
 
     Thus, you should use these backends only when you know that your
     repository will not ever grow very large, not just that it's not
@@ -182,7 +217,7 @@ rsync URIs
 
 rclone backend
     In addition to adding the rclone backend as a remote with URI like
-    ``gcrypt::rclone://remote:subdir``, you must add the remote to the
+    ``pwcrypt::rclone://remote:subdir``, you must add the remote to the
     rclone configuration too.  This is typically done by executing
     ``rclone config``.  See rclone(1).
 
@@ -192,7 +227,7 @@ rclone backend
 Repository format
 .................
 
-| `EncSign(X):`   Sign and Encrypt to GPG key holder
+| `PwEnc(X):`     Encrypt with the passphrase (gpg --symmetric, with MDC)
 | `Encrypt(K,X):` Encrypt using symmetric-key algorithm
 | `Hash(X):`      SHA-2/256
 |
@@ -204,11 +239,11 @@ Repository format
 |
 | Store each packfile `P` as `Encrypt(Ki, P)` → `P'` in filename `Hi`
 |   where `Ki` is a new random string and `Hash(P')` → `Hi`
-| Store `EncSign(B || L || R)` in the manifest
+| Store `PwEnc(B || L || R)` in the manifest
 |
 | To read the repository:
 |
-| Get manifest, decrypt and verify using GPG keyring → `(B, L, R)`
+| Get manifest, decrypt with the passphrase and check integrity → `(B, L, R)`
 | Warn if `R` does not match previously seen Remote ID
 | for each `Hi, Ki` in `L`:
 |   Get file `Hi` from the server → `P'`
@@ -245,16 +280,16 @@ Each item extends until newline, and matches one of the following:
 ``extn <name> ...``
     Extension field, preserved but unused.
 
-Detecting gcrypt repos
-======================
+Detecting pwcrypt repos
+=======================
 
-To detect if a git url is a gcrypt repo, use: ``git-remote-gcrypt --check url``
+To detect if a git url is a pwcrypt repo, use: ``git-remote-pwcrypt --check url``
 Exit status is 0 if the repo exists and can be decrypted, 1 if the repo
-uses gcrypt but could not be decrypted, and 100 if the repo is not
-encrypted with gcrypt (or could not be accessed).
+uses pwcrypt but could not be decrypted, and 100 if the repo is not
+encrypted with pwcrypt (or could not be accessed).
 
 Note that this has to fetch the repo contents into the local git
-repository, the same as is done when using a gcrypt repo.
+repository, the same as is done when using a pwcrypt repo.
 
 Known issues
 ============
@@ -262,13 +297,13 @@ Known issues
 Every git push effectively has ``--force``.  Be sure to pull before
 pushing.
 
-git-remote-gcrypt can decide to repack the remote without warning,
+git-remote-pwcrypt can decide to repack the remote without warning,
 which means that your push can suddenly take significantly longer than
 you were expecting, as your whole history has to be reuploaded.
 This push might fail over a poor link.
 
-git-remote-gcrypt might report a repository as "not found" when the
-repository does in fact exist, but git-remote-gcrypt is having
+git-remote-pwcrypt might report a repository as "not found" when the
+repository does in fact exist, but git-remote-pwcrypt is having
 authentication, port, or network connectivity issues.
 
 See also
@@ -279,7 +314,7 @@ git-remote-helpers(1), gpg(1)
 Credits
 =======
 
-The original author of git-remote-gcrypt was GitHub user bluss.
+The original author of git-remote-pwcrypt was GitHub user bluss.
 
 The de facto maintainer in 2013 and 2014 was Joey Hess.
 
@@ -289,8 +324,8 @@ The current maintainer, since 2016, is Sean Whitton
 License
 =======
 
-This document and git-remote-gcrypt are licensed under identical terms,
-GPL-3 (or 2+); see the git-remote-gcrypt file.
+This document and git-remote-pwcrypt are licensed under identical terms,
+GPL-3 (or 2+); see the git-remote-pwcrypt file.
 
 .. this document generates a man page with rst2man
 .. vim: ft=rst tw=72 sts=4

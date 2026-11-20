@@ -1,3 +1,13 @@
+git-remote-pwcrypt (1.0-1) unstable; urgency=medium
+
+  * Fork of git-remote-gcrypt as git-remote-pwcrypt: passphrase-only
+    encryption, with its own pwcrypt:: URL scheme, pwcrypt-* / pwcrypt.*
+    configuration keys, PWCRYPT_* environment variables and local
+    directory, installable alongside git-remote-gcrypt.
+  * Repackage under the new name; drop the GPG-key code paths.
+
+ -- powerbq <powerbq@gmail.com>  Fri, 20 Nov 2026 14:48:39 +0200
+
 git-remote-gcrypt (1.6-1) UNRELEASED; urgency=medium
 
   * New integration test for gitception, tests/system-test.sh.

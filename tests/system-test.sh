@@ -4,13 +4,13 @@
 set -efuC -o pipefail
 shopt -s inherit_errexit
 
-# Unlike the main git-remote-gcrypt program, this testing script requires bash
+# Unlike the main git-remote-pwcrypt program, this testing script requires bash
 # (rather than POSIX sh) and also depends on various common system utilities
-# that the git-remote-gcrypt carefully avoids using (such as mktemp(1)).
+# that the git-remote-pwcrypt carefully avoids using (such as mktemp(1)).
 #
 # The test proceeds by setting up a new repository, making some large commits
 # with random data into the repository, pushing the repository to another
-# remote using git-remote-gcrypt over the gitception protocol, and then cloning
+# remote using git-remote-pwcrypt over the gitception protocol, and then cloning
 # the second repository and ensuring that the data it contains is correct.
 #
 # The random data is obtained from /dev/urandom. This script won't work
@@ -22,8 +22,8 @@ files_per_commit=3
 random_source="/dev/urandom"
 random_data_per_file=5242880 # 5 MiB
 default_branch="main"
-test_user_name="git-remote-gcrypt"
-test_user_email="git-remote-gcrypt@example.com"
+test_user_name="git-remote-pwcrypt"
+test_user_email="git-remote-pwcrypt@example.com"
 pack_size_limit="12m" # If this variable is unset, there is no size limit.
 
 readonly num_commits files_per_commit random_source random_data_per_file \
@@ -59,7 +59,7 @@ readonly tempdir
 # shellcheck disable=SC2064
 trap "rm -Rf -- '${tempdir}'" EXIT
 
-# Set up the PATH to favor the version of git-remote-gcrypt from the repository
+# Set up the PATH to favor the version of git-remote-pwcrypt from the repository
 # rather than a version that might already be installed on the user's system.
 PATH=$(git rev-parse --show-toplevel):${PATH}
 readonly PATH
@@ -75,7 +75,7 @@ export GNUPGHOME="${tempdir}/gpg"
 mkdir "${GNUPGHOME}"
 # Use a wrapper for gpg(1) to avoid cluttering the test output with unnecessary
 # warnings about the obsolete `--secret-keyring` option. These warnings are
-# caused by git-remote-gcrypt passing an option to gpg(1) that only makes sense
+# caused by git-remote-pwcrypt passing an option to gpg(1) that only makes sense
 # for ancient versions of gpg(1), but addressing that (if it should be
 # addressed at all) is a task best left for another day.
 cat << 'EOF' > "${GNUPGHOME}/gpg"
@@ -110,14 +110,15 @@ random_data_size=$(( total_files * random_data_per_file ))
 random_data_file="${tempdir}/data"
 head -c "${random_data_size}" "${random_source}" > "${random_data_file}"
 
-# Create gpg key and subkey.
-echo "Step 1: Creating a new GPG key and subkey to use for testing:"
-(
-    set -x
-    gpg --batch --passphrase "" --quick-generate-key \
-        "${test_user_name} <${test_user_email}>"
-    gpg -K
-) 2>&1 | indent
+# pwcrypt uses a passphrase only; supply it non-interactively.
+echo "Step 1: Setting up a passphrase (PWCRYPT_ASKPASS) for testing:"
+printf '%s' 'system-test passphrase with spaces & symbols !@#' \
+    > "${tempdir}/passphrase"
+printf '#!/bin/sh\ncat "%s"\n' "${tempdir}/passphrase" > "${tempdir}/askpass"
+chmod +x "${tempdir}/askpass"
+export PWCRYPT_ASKPASS="${tempdir}/askpass"
+git config --global pwcrypt.s2k-count 1048576
+echo "Using ${PWCRYPT_ASKPASS}" | indent
 
 ###
 section_break
@@ -163,12 +164,12 @@ section_break
 
 echo "Step 4: Pushing the first repository to the second one using gitception:"
 {
-    # Note that when pushing to a bare local repository, git-remote-gcrypt uses
+    # Note that when pushing to a bare local repository, git-remote-pwcrypt uses
     # gitception, rather than treating the remote as a local repository.
     (
         set -x
         cd "${tempdir}/first"
-        git push -f "gcrypt::${tempdir}/second.git#${default_branch}" \
+        git push -f "pwcrypt::${tempdir}/second.git#${default_branch}" \
             "${default_branch}"
     ) 2>&1
 
@@ -202,7 +203,7 @@ echo "Step 5: Cloning the second repository using gitception:"
     (
         set -x
         git clone -b "${default_branch}" \
-            "gcrypt::${tempdir}/second.git#${default_branch}" -- \
+            "pwcrypt::${tempdir}/second.git#${default_branch}" -- \
                 "${tempdir}/third"
     ) 2>&1
 
